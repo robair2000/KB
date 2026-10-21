@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+numpy
+pandas==2.2.2
+requests>=2.31.0
+einops==0.8.1
+huggingface_hub==0.33.1
+safetensors==0.6.2
+tqdm==4.67.1
