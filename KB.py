@@ -1,13 +1,26 @@
 import os
+import sys
 import time
 import hmac
 import hashlib
 import base64
 import requests
+import json
+import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoModel, AutoTokenizer
+import torch.nn as nn
+import torch.nn.functional as F
+from huggingface_hub import PyTorchModelHubMixin
+from tqdm import trange
 from datetime import datetime
+
+# Zorg dat eventuele submodules uit de model-map correct kunnen worden geïmporteerd
+sys.path.append("../")
+try:
+    from model.module import *
+except ImportError:
+    pass
 
 # =====================================================================
 # CONFIGURATIE & ENVIRONMENT VARIABLES (LIVE MAINNET)
@@ -16,216 +29,221 @@ API_KEY = os.getenv("KUCOIN_API_KEY", "")
 API_SECRET = os.getenv("KUCOIN_API_SECRET", "")
 API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE", "")
 
-# GEVALIDEERD: Geforceerd op Mainnet met de juiste API Base URL
 IS_SANDBOX = False 
-BASE_URL = "https://api.kucoin.com" 
+BASE_URL = "https://kucoin.com" 
 
 # Whitelist van handelsparen tegen USDT
 HANDELSPAREN = ["DOGE-USDT", "BTC-USDT", "LINK-USDT", "ETH-USDT", "SOL-USDT"]
 
-# Hugging Face Identifiers voor Kronos-base
-MODEL_NAME = "NeoQuasar/Kronos-base"
+# Hugging Face Identifiers voor Kronos-base (Aangepaste mixin pipeline)
+MODEL_NAME = "NeoQuasar/Kronos-small"
 TOKENIZER_NAME = "NeoQuasar/Kronos-Tokenizer-base"
 
-print(f"[*] [LIVE] AI-Model initialiseren: {MODEL_NAME} vanaf Hugging Face...")
-try:
-    # REPARATIE: We laden een compatibele base-tokenizer in die de tokenization-fout omzeilt
-    from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-    
-    # We gebruiken een stabiele base-tokenizer als drager voor het tokenformat van Kronos
-    tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=False)
-    tokenizer.model_max_length = 512
-    
-    # REPARATIE: Omdat de config.json van NeoQuasar geen model_type bevat,
-    # laden we de ruwe model-gewichten in via een generieke model-pipeline om de JSON-fout te omzeilen
-    config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    
-    # Mocht de config de 'model_type' missen, forceren we de juiste transformer-decoder structuur
-    if not hasattr(config, "model_type"):
-        config.model_type = "gpt2" 
-        
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, 
-        config=config,
-        trust_remote_code=True
-    )
-    model.eval() 
-    print("[+] [LIVE] Kronos-base succesvol ingeladen in het servergeheugen.")
-except Exception as e:
-    print(f"[-] Eerste methode mislukt ({e}). Directe tensor-bypass activeren...")
-    try:
-        # Ultieme directe bypass: We omzeilen de HF-config laders volledig en trekken 
-        # de modelgewichten direct in een generieke transformer-architectuur
-        from transformers import AutoModel
-        tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=False)
-        model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True, config=None)
-        model.eval()
-        print("[+] [LIVE] Kronos-base succesvol ingeladen via directe tensor-pipeline.")
-    except Exception as inner_e:
-        print(f"[-] KRITISCHE FOUT bij laden AI-model: {inner_e}")
-        raise SystemExit("Applicatie gestopt: AI-model kon niet worden geactiveerd.")
-
-
 # =====================================================================
-# AUTHENTICATIE EN KOPPELING FUNCTIES
+# AANGEPASTE KRONOS REPARATIE-KLASSEN & INFERENCE LOGICA
 # =====================================================================
-def genereer_kucoin_headers(endpoint, methode="GET", body_str=""):
-    timestamp = str(int(time.time() * 1000))
-    str_to_sign = timestamp + methode.upper() + endpoint + body_str
-    handtekening = base64.b64encode(hmac.new(API_SECRET.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest()).decode('utf-8')
-    beveiligde_passphrase = base64.b64encode(hmac.new(API_SECRET.encode('utf-8'), API_PASSPHRASE.encode('utf-8'), hashlib.sha256).digest()).decode('utf-8')
-    return {
-        "KC-API-KEY": API_KEY, "KC-API-SIGN": handtekening, "KC-API-TIMESTAMP": timestamp,
-        "KC-API-PASSPHRASE": beveiligde_passphrase, "KC-API-KEY-VERSION": "2", "Content-Type": "application/json"
-    }
 
-def haal_live_saldo():
-    """Haalt het actuele USDT saldo op van je KuCoin Handelsaccount."""
-    endpoint = "/api/v1/accounts?type=trade&currency=USDT"
-    headers = genereer_kucoin_headers(endpoint, methode="GET")
-    try:
-        response = requests.get(BASE_URL + endpoint, headers=headers)
-        if response.status_code == 200:
-            data = response.json().get("data", [])
-            # Veilige check om IndexErrors te voorkomen als de lijst leeg is
-            for account in data:
-                if account.get("currency") == "USDT":
-                    return float(account.get("balance", 0.0))
-    except Exception as e:
-        print(f"[-] Fout bij ophalen live saldo: {e}")
-    return 0.0
+class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
+    def __init__(self, d_in, d_model, n_heads, ff_dim, n_enc_layers, n_dec_layers, ffn_dropout_p, attn_dropout_p, resid_dropout_p, s1_bits, s2_bits, beta, gamma0, gamma, zeta, group_size):
+        super().__init__()
+        self.d_in = d_in
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.ff_dim = ff_dim
+        self.enc_layers = n_enc_layers
+        self.dec_layers = n_dec_layers
+        self.ffn_dropout_p = ffn_dropout_p
+        self.attn_dropout_p = attn_dropout_p
+        self.resid_dropout_p = resid_dropout_p
 
-def haal_historische_candles(symbol, interval="1hour", limit=50):
-    endpoint = f"/api/v1/market/candles?symbol={symbol}&type={interval}&limit={limit}"
-    try:
-        response = requests.get(BASE_URL + endpoint)
-        if response.status_code == 200:
-            data = response.json().get("data", [])
-            df = pd.DataFrame(data, columns=["time", "open", "close", "high", "low", "volume", "turnover"])
-            for col in ["open", "close", "high", "low", "volume"]:
-                df[col] = pd.to_numeric(df[col])
-            return df.iloc[::-1].reset_index(drop=True)
-    except Exception as e:
-        print(f"[-] Fout bij ophalen live marktgeschiedenis voor {symbol}: {e}")
-    return None
+        self.s1_bits = s1_bits
+        self.s2_bits = s2_bits
+        self.codebook_dim = s1_bits + s2_bits
+        self.embed = nn.Linear(self.d_in, self.d_model)
+        self.head = nn.Linear(self.d_model, self.d_in)
 
-# =====================================================================
-# REAL LIVE KRONOS AI INFERENCE
-# =====================================================================
-def bereken_kronos_ai_signaal(df):
-    try:
-        if df is None or len(df) < 30:
-            return "HOLD"
-            
-        input_text = ""
-        for _, row in df.tail(50).iterrows():
-            input_text += f"O:{row['open']:.4f} H:{row['high']:.4f} L:{row['low']:.4f} C:{row['close']:.4f} v:{row['volume']:.0f} | "
+        self.encoder = nn.ModuleList([
+            TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
+            for _ in range(self.enc_layers - 1)
+        ])
+        self.decoder = nn.ModuleList([
+            TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
+            for _ in range(self.dec_layers - 1)
+        ])
+        self.quant_embed = nn.Linear(in_features=self.d_model, out_features=self.codebook_dim)
+        self.post_quant_embed_pre = nn.Linear(in_features=self.s1_bits, out_features=self.d_model)
+        self.post_quant_embed = nn.Linear(in_features=self.codebook_dim, out_features=self.d_model)
+        self.tokenizer = BSQuantizer(self.s1_bits, self.s2_bits, beta, gamma0, gamma, zeta, group_size)
 
-        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            outputs = model(**inputs)
-            
-        hidden_states = outputs.last_hidden_state
-        richting_waarde = torch.tanh(hidden_states[0, -1, 0]).item()
-        
-        if richting_waarde > 0.4:
-            return "BUY"
-        elif richting_waarde < -0.4:
-            return "SELL"
-        return "HOLD"
-    except Exception as e:
-        print(f"[-] AI Inference fout: {e}")
-        return "HOLD"
+    def forward(self, x):
+        z = self.embed(x)
+        for layer in self.encoder:
+            z = layer(z)
+        z = self.quant_embed(z)
+        bsq_loss, quantized, z_indices = self.tokenizer(z)
 
-def bereken_veilig_risico(totaal_kapitaal, huidige_koers, stop_loss_percentage=0.03, max_risico_fractie=0.01):
-    max_verlies_bedrag = totaal_kapitaal * max_risico_fractie
-    risico_per_eenheid = huidige_koers * stop_loss_percentage
-    aantal_eenheden = max_verlies_bedrag / risico_per_eenheid
-    totale_waarde = aantal_eenheden * huidige_koers
-    
-    if totale_waarde > totaal_kapitaal:
-        totale_waarde = totaal_kapitaal
-        aantal_eenheden = totale_waarde / huidige_koers
-        
-    return {
-        "eenheden": round(aantal_eenheden, 2), 
-        "waarde_usdt": round(totale_waarde, 2),
-        "stop_loss_prijs": round(huidige_koers * (1 - stop_loss_percentage), 4)
-    }
+        quantized_pre = quantized[:, :, :self.s1_bits]
+        z_pre = self.post_quant_embed_pre(quantized_pre)
+        z = self.post_quant_embed(quantized)
 
-def plaats_limiet_order(symbol, side, size, price):
-    if symbol not in HANDELSPAREN: return None
-    if size <= 0: 
-        print(f"[-] Order geweigerd: berekende ordergrootte is 0.")
-        return None
-        
-    endpoint = "/api/v1/orders"
-    payload = {
-        "clientOid": str(int(time.time() * 1000000)),
-        "side": side.lower(),
-        "symbol": symbol,
-        "type": "limit",
-        "size": str(size),
-        "price": str(round(price, 5)),
-        "timeInForce": "GTC"
-    }
-    import json
-    body_str = json.dumps(payload)
-    headers = genereer_kucoin_headers(endpoint, methode="POST", body_str=body_str)
-    try:
-        response = requests.post(BASE_URL + endpoint, headers=headers, data=body_str)
-        return response.json()
-    except Exception as e:
-        print(f"[-] KRITISCHE FOUT bij verzenden live order: {e}")
-        return None
+        for layer in self.decoder:
+            z_pre = layer(z_pre)
+        z_pre = self.head(z_pre)
 
-# =====================================================================
-# HOOFDPROGRAMMA (LIVE TRADING LOOP)
-# =====================================================================
-def main():
-    print("==================================================")
-    print(f"⚠️  🚨 KRONOS LIVE TRADING BOT - ECHT GELD ACTIEF - {datetime.now()}")
-    print("==================================================")
-    
-    if not API_KEY or not API_SECRET or not API_PASSPHRASE:
-        print("❌ FOUT: Live API-sleutels ontbreken in de variabelen!")
-        return
+        for layer in self.decoder:
+            z = layer(z)
+        z = self.head(z)
+        return (z_pre, z), bsq_loss, quantized, z_indices
 
-    while True:
-        live_saldo = haal_live_saldo()
-        print(f"\n[💰 LIVE BALANS]: {live_saldo:.2f} USDT beschikbaar op Handelsaccount.")
-        
-        if live_saldo < 10.0:
-            print("[⚠️] Saldo is te laag om minimale orders te plaatsen (Minimaal $10 vereist). Bot wacht 5 minuten...")
-            time.sleep(300)
-            continue
+    def indices_to_bits(self, x, half=False):
+        if half:
+            x1 = x[0]
+            x2 = x[1]
+            mask = 2 ** torch.arange(self.codebook_dim//2, device=x1.device, dtype=torch.long)
+            x1 = (x1.unsqueeze(-1) & mask) != 0
+            x2 = (x2.unsqueeze(-1) & mask) != 0
+            x = torch.cat([x1, x2], dim=-1)
+        else:
+            mask = 2 ** torch.arange(self.codebook_dim, device=x.device, dtype=torch.long)
+            x = (x.unsqueeze(-1) & mask) != 0
 
-        for paar in HANDELSPAREN:
-            print(f"\n[*] Analyseren live markt: {paar}...")
-            df_candles = haal_historische_candles(paar)
-            
-            if df_candles is None or df_candles.empty:
-                continue
-                
-            huidige_koers = df_candles['close'].iloc[-1]
-            print(f"[+] Huidige koers {paar}: ${huidige_koers}")
-            
-            ai_signaal = bereken_kronos_ai_signaal(df_candles)
-            print(f"[🤖 AI Model Signaal]: {ai_signaal}")
-            
-            if ai_signaal == "BUY":
-                risico = bereken_veilig_risico(live_saldo, huidige_koers)
-                print(f"[🛡️ Risicomanagement]: ECHT GELD ORDER -> Koop {risico['eenheden']} {paar} | SL op: ${risico['stop_loss_prijs']}")
-                
-                # REPARATIE: De transmissie naar de live exchange wordt nu correct uitgevoerd
-                order_resultaat = plaats_limiet_order(paar, "buy", risico["eenheden"], huidige_koers)
-                print(f"[📋 API Respons]: {order_resultaat}")
-                
-            elif ai_signaal == "SELL":
-                print(f"[-] AI signaleert verkoop voor {paar}. Controleer handmatig je posities.")
-                
-        print(f"\n[ Live ] Ronde voltooid. Wachten op volgende interval (5 minuten)...")
-        time.sleep(300)
+        x = x.float() * 2 - 1
+        q_scale = 1. / (self.codebook_dim ** 0.5)
+        x = x * q_scale
+        return x
 
-if __name__ == "__main__":
-    main()
+    def encode(self, x, half=False):
+        z = self.embed(x)
+        for layer in self.encoder:
+            z = layer(z)
+        z = self.quant_embed(z)
+        bsq_loss, quantized, z_indices = self.tokenizer(z, half=half, collect_metrics=False)
+        return z_indices
+
+    def decode(self, x, half=False):
+        quantized = self.indices_to_bits(x, half)
+        z = self.post_quant_embed(quantized)
+        for layer in self.decoder:
+            z = layer(z)
+        z = self.head(z)
+        return z
+
+
+class Kronos(nn.Module, PyTorchModelHubMixin):
+    def __init__(self, s1_bits, s2_bits, n_layers, d_model, n_heads, ff_dim, ffn_dropout_p, attn_dropout_p, resid_dropout_p, token_dropout_p, learn_te):
+        super().__init__()
+        self.s1_bits = s1_bits
+        self.s2_bits = s2_bits
+        self.n_layers = n_layers
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.learn_te = learn_te
+        self.ff_dim = ff_dim
+        self.ffn_dropout_p = ffn_dropout_p
+        self.attn_dropout_p = attn_dropout_p
+        self.resid_dropout_p = resid_dropout_p
+        self.token_dropout_p = token_dropout_p
+
+        self.s1_vocab_size = 2 ** self.s1_bits
+        self.token_drop = nn.Dropout(self.token_dropout_p)
+        self.embedding = HierarchicalEmbedding(self.s1_bits, self.s2_bits, self.d_model)
+        self.time_emb = TemporalEmbedding(self.d_model, self.learn_te)
+        self.transformer = nn.ModuleList([
+            TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
+            for _ in range(self.n_layers)
+        ])
+        self.norm = RMSNorm(self.d_model)
+        self.dep_layer = DependencyAwareLayer(self.d_model)
+        self.head = DualHead(self.s1_bits, self.s2_bits, self.d_model)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0, std=self.embedding.d_model ** -0.5)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, RMSNorm):
+            nn.init.ones_(module.weight)
+
+    def forward(self, s1_ids, s2_ids, stamp=None, padding_mask=None, use_teacher_forcing=False, s1_targets=None):
+        x = self.embedding([s1_ids, s2_ids])
+        if stamp is not None:
+            time_embedding = self.time_emb(stamp)
+            x = x + time_embedding
+        x = self.token_drop(x)
+
+        for layer in self.transformer:
+            x = layer(x, key_padding_mask=padding_mask)
+
+        x = self.norm(x)
+        s1_logits = self.head(x)
+
+        if use_teacher_forcing:
+            sibling_embed = self.embedding.emb_s1(s1_targets)
+        else:
+            s1_probs = F.softmax(s1_logits.detach(), dim=-1)
+            sample_s1_ids = torch.multinomial(s1_probs.view(-1, self.s1_vocab_size), 1).view(s1_ids.shape)
+            sibling_embed = self.embedding.emb_s1(sample_s1_ids)
+
+        x2 = self.dep_layer(x, sibling_embed, key_padding_mask=padding_mask)
+        s2_logits = self.head.cond_forward(x2)
+        return s1_logits, s2_logits
+
+    def decode_s1(self, s1_ids, s2_ids, stamp=None, padding_mask=None):
+        x = self.embedding([s1_ids, s2_ids])
+        if stamp is not None:
+            time_embedding = self.time_emb(stamp)
+            x = x + time_embedding
+        x = self.token_drop(x)
+
+        for layer in self.transformer:
+            x = layer(x, key_padding_mask=padding_mask)
+
+        x = self.norm(x)
+        s1_logits = self.head(x)
+        return s1_logits, x
+
+    def decode_s2(self, context, s1_ids, padding_mask=None):
+        sibling_embed = self.embedding.emb_s1(s1_ids)
+        x2 = self.dep_layer(context, sibling_embed, key_padding_mask=padding_mask)
+        return self.head.cond_forward(x2)
+
+
+def top_k_top_p_filtering(logits, top_k: int = 0, top_p: float = 1.0, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+    if top_k > 0:
+        top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+        return logits
+
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        if min_tokens_to_keep > 1:
+            sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = filter_value
+        return logits
+
+
+def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_logits=True):
+    logits = logits / temperature
+    if top_k is not None or top_p is not None:
+        if top_k > 0 or top_p < 1.0:
+            logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+    probs = F.softmax(logits, dim=-1)
+    if not sample_logits:
+        _, x = torch.topk(probs, k=1, dim=-1)
+    else:
+        x = torch.multinomial(probs, num_samples=1)
+    return x
+
+
