@@ -12,14 +12,13 @@ from datetime import datetime
 # =====================================================================
 # CONFIGURATIE & ENVIRONMENT VARIABLES (LIVE MAINNET)
 # =====================================================================
-# Zorg ervoor dat je LIVE API-sleutels van KuCoin (Mainnet) in Render/Railway staan!
 API_KEY = os.getenv("KUCOIN_API_KEY", "")
 API_SECRET = os.getenv("KUCOIN_API_SECRET", "")
 API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE", "")
 
-# HARDCODED GEWIJZIGD: Geforceerd op Mainnet (echt geld)
+# GEVALIDEERD: Geforceerd op Mainnet met de juiste API Base URL
 IS_SANDBOX = False 
-BASE_URL = "https://kucoin.com" 
+BASE_URL = "https://api.kucoin.com" 
 
 # Whitelist van handelsparen tegen USDT
 HANDELSPAREN = ["DOGE-USDT", "BTC-USDT", "LINK-USDT", "ETH-USDT", "SOL-USDT"]
@@ -59,8 +58,10 @@ def haal_live_saldo():
         response = requests.get(BASE_URL + endpoint, headers=headers)
         if response.status_code == 200:
             data = response.json().get("data", [])
-            if data:
-                return float(data[0].get("balance", 0.0))
+            # Veilige check om IndexErrors te voorkomen als de lijst leeg is
+            for account in data:
+                if account.get("currency") == "USDT":
+                    return float(account.get("balance", 0.0))
     except Exception as e:
         print(f"[-] Fout bij ophalen live saldo: {e}")
     return 0.0
@@ -108,7 +109,6 @@ def bereken_kronos_ai_signaal(df):
         return "HOLD"
 
 def bereken_veilig_risico(totaal_kapitaal, huidige_koers, stop_loss_percentage=0.03, max_risico_fractie=0.01):
-    # Riskiert strikt maximaal 1% van je accountwaarde per trade
     max_verlies_bedrag = totaal_kapitaal * max_risico_fractie
     risico_per_eenheid = huidige_koers * stop_loss_percentage
     aantal_eenheden = max_verlies_bedrag / risico_per_eenheid
@@ -119,7 +119,7 @@ def bereken_veilig_risico(totaal_kapitaal, huidige_koers, stop_loss_percentage=0
         aantal_eenheden = totale_waarde / huidige_koers
         
     return {
-        "eenheden": round(aantal_eenheden, 2), # KuCoin vereist vaak max 2-4 decimalen afhankelijk van de asset
+        "eenheden": round(aantal_eenheden, 2), 
         "waarde_usdt": round(totale_waarde, 2),
         "stop_loss_prijs": round(huidige_koers * (1 - stop_loss_percentage), 4)
     }
@@ -163,12 +163,11 @@ def main():
         return
 
     while True:
-        # Haal realtime je echte USDT saldo op van KuCoin
         live_saldo = haal_live_saldo()
         print(f"\n[💰 LIVE BALANS]: {live_saldo:.2f} USDT beschikbaar op Handelsaccount.")
         
         if live_saldo < 10.0:
-            print("[⚠️] Saldo is te laag om minimale orders te plaatsen (Minimaal $10 vereist). Bot wacht...")
+            print("[⚠️] Saldo is te laag om minimale orders te plaatsen (Minimaal $10 vereist). Bot wacht 5 minuten...")
             time.sleep(300)
             continue
 
@@ -189,7 +188,7 @@ def main():
                 risico = bereken_veilig_risico(live_saldo, huidige_koers)
                 print(f"[🛡️ Risicomanagement]: ECHT GELD ORDER -> Koop {risico['eenheden']} {paar} | SL op: ${risico['stop_loss_prijs']}")
                 
-                # EXECUTEER TRANSMISSIE OP HET LIVE NETWERK
+                # REPARATIE: De transmissie naar de live exchange wordt nu correct uitgevoerd
                 order_resultaat = plaats_limiet_order(paar, "buy", risico["eenheden"], huidige_koers)
                 print(f"[📋 API Respons]: {order_resultaat}")
                 
