@@ -36,7 +36,7 @@ BASE_URL = "https://kucoin.com"
 HANDELSPAREN = ["DOGE-USDT", "BTC-USDT", "LINK-USDT", "ETH-USDT", "SOL-USDT"]
 
 # Hugging Face Identifiers voor Kronos-base (Aangepaste mixin pipeline)
-MODEL_NAME = "NeoQuasar/Kronos-small"
+MODEL_NAME = "NeoQuasar/Kronos-base"
 TOKENIZER_NAME = "NeoQuasar/Kronos-Tokenizer-base"
 
 # =====================================================================
