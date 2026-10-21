@@ -1,6 +1,6 @@
 --extra-index-url https://pytorch.org
-torch==2.1.2
-transformers==4.36.2
-requests==2.31.0
-pandas==2.1.4
-numpy==1.26.2
+torch
+transformers>=4.40.0
+requests>=2.31.0
+pandas>=2.2.0
+numpy>=1.26.0
