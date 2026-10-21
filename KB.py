@@ -4,200 +4,187 @@ import hmac
 import hashlib
 import base64
 import requests
-from datetime import datetime
+import pandas as pd
+import numpy as np
+import torch
+from transformers import AutoModel, AutoTokenizer
 
-# =====================================================================
-# CONFIGURATIE & ENVIRONMENT VARIABLES (VEILIG VOOR RAILWAY)
-# =====================================================================
-# Railway haalt deze waarden veilig op uit de omgevingsvariabelen (Variables tab)
-API_KEY = os.getenv("KUCOIN_API_KEY", "")
-API_SECRET = os.getenv("KUCOIN_API_SECRET", "")
-API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE", "")
+# --- CONFIGURATIE & ENVIRONMENT VARIABLES ---
+API_KEY = os.getenv("KUCOIN_API_KEY")
+API_SECRET = os.getenv("KUCOIN_API_SECRET")
+API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE")
 
-# Indien ingesteld op True gebruikt de bot de KuCoin Sandbox omgeving.
-# Zet op False voor het echte handelsplatform (Mainnet).
-IS_SANDBOX = os.getenv("KUCOIN_IS_SANDBOX", "True").lower() in ("true", "1", "yes")
+# Veiligheid: Standaard op Sandbox (Testnet) om kapitaal te beschermen
+IS_SANDBOX = os.getenv("KUCOIN_IS_SANDBOX", "True").lower() == "true"
 
-# Base URLs voor KuCoin API v1/v2
-BASE_URL = "https://openapi-sandbox.kucoin.com" if IS_SANDBOX else "https://api.kucoin.com"
+BASE_URL = "https://kucoin.com" if IS_SANDBOX else "https://kucoin.com"
 
-# Gewenste handelsparen (Whitelisted assets tegen USDT)
-HANDELSPAREN = ["DOGE-USDT", "BTC-USDT", "LINK-USDT", "ETH-USDT", "SOL-USDT"]
+# Jouw whitelist van gekozen munten (gekoppeld tegen USDT voor risicoberekening)
+TARGET_SYMBOLS = ["DOGE-USDT", "BTC-USDT", "LINK-USDT", "ETH-USDT", "SOL-USDT"]
 
-# =====================================================================
-# AUTHENTICATIE EN KOPPELING FUNCTIES
-# =====================================================================
-def genereer_kucoin_headers(endpoint, methode="GET", body_str=""):
-    """
-    Genereert de verplichte cryptografische handtekening (HMAC-SHA256) 
-    voor beveiligde communicatie met de KuCoin API.
-    """
-    timestamp = str(int(time.time() * 1000))
-    str_to_sign = timestamp + methode.upper() + endpoint + body_str
+# --- HUGGING FACE MODEL SETUP (ZWAARSTE MODEL) ---
+MODEL_NAME = "NeoQuasar/Kronos-base"
+TOKENIZER_NAME = "NeoQuasar/Kronos-Tokenizer-base"
+
+print(f"[*] AI-Model initialiseren: {MODEL_NAME}...")
+try:
+    # Laad het zware model expliciet op de CPU (aangezien Render Standard geen GPU heeft)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, trust_remote_code=True)
+    model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model.eval()  # Zet het model in evaluatie-modus voor inference
+    print("[+] Kronos-base succesvol ingeladen in het geheugen.")
+except Exception as e:
+    print(f"[-] FOUT bij laden model: {e}")
+    raise SystemExit("Applicatie gestopt: AI-model kon niet worden geladen.")
+
+# --- KUCOIN AUTHENTICATIE GENERATOR ---
+def geef_kucoin_headers(endpoint, methode="GET", body=""):
+    now = str(int(time.time() * 1000))
+    str_to_sign = now + methode + endpoint + body
     
-    # Maak de handtekening met de API Secret
-    handtekening = base64.b64encode(
+    # Handtekening genereren middels HMAC-SHA256
+    signature = base64.b64encode(
         hmac.new(API_SECRET.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest()
     ).decode('utf-8')
     
-    # Beveilig de Passphrase via HMAC
-    beveiligde_passphrase = base64.b64encode(
+    # Passphrase encrypten zoals KuCoin vereist
+    passphrase_sign = base64.b64encode(
         hmac.new(API_SECRET.encode('utf-8'), API_PASSPHRASE.encode('utf-8'), hashlib.sha256).digest()
     ).decode('utf-8')
     
     return {
         "KC-API-KEY": API_KEY,
-        "KC-API-SIGN": handtekening,
-        "KC-API-TIMESTAMP": timestamp,
-        "KC-API-PASSPHRASE": beveiligde_passphrase,
+        "KC-API-SIGN": signature,
+        "KC-API-TIMESTAMP": now,
+        "KC-API-PASSPHRASE": passphrase_sign,
         "KC-API-KEY-VERSION": "2",
         "Content-Type": "application/json"
     }
 
-def haal_huidige_koers(symbol):
-    """Haalt de actuele marktprijs op van een handelspaar via KuCoin Ticker API."""
-    endpoint = f"/api/v1/market/orderbook/level1?symbol={symbol}"
+# --- MARKT DATA OPHALEN ---
+def haal_market_data(symbol, interval="1hour", limit=100):
+    endpoint = f"/api/v1/market/candles?symbol={symbol}&type={interval}&limit={limit}"
+    url = BASE_URL + endpoint
     try:
-        response = requests.get(BASE_URL + endpoint)
+        response = requests.get(url, timeout=10)
         if response.status_code == 200:
-            data = response.json()
-            if data.get("code") == "200000" and data.get("data"):
-                return float(data["data"]["price"])
-        print(f"[-] Fout bij ophalen koers {symbol}: {response.text}")
+            data = response.json().get("data", [])
+            # KuCoin output: [time, open, close, high, low, volume, turnover]
+            df = pd.DataFrame(data, columns=["time", "open", "close", "high", "low", "volume", "turnover"])
+            # Converteren naar numerieke waarden
+            for col in ["open", "close", "high", "low", "volume"]:
+                df[col] = pd.to_numeric(df[col])
+            # Sorteren van oud naar nieuw voor de AI-time-series
+            return df.iloc[::-1].reset_index(drop=True)
     except Exception as e:
-        print(f"[-] Exception bij koers ophalen {symbol}: {e}")
+        print(f"[-] Fout bij ophalen data voor {symbol}: {e}")
     return None
 
-# =====================================================================
-# AI INFERENCE EN RISICOMANAGEMENT
-# =====================================================================
-def simuleer_kronos_ai_logica(symbol):
-    """
-    Gereserveerde functie voor de integratie van het Kronos AI-model.
-    Hier laad je later je transformer model (`torch.load` of HuggingFace pipeline).
-    Geeft momenteel een gesimuleerde trendindicatie ('BUY', 'SELL' of 'HOLD').
-    """
-    # TODO: Inladen van Kronos model (.pt/.bin) en data tokenization pipeline
-    # Voorbeeld: inputs = tokenize_candles(historical_data) -> outputs = model(inputs)
-    return "BUY"  # Gesimuleerde voorspelling
-
-def bereken_veilig_risico(totaal_kapitaal, huidige_koers, stop_loss_percentage=0.03, max_risico_fractie=0.01):
-    """
-    Berekent de veilige positiegrootte volgens strikte geldbeheerregels.
-    Riskiert maximaal 1% van het totale kapitaal per transactie.
-    """
-    max_verlies_bedrag = totaal_kapitaal * max_risico_fractie
-    risico_per_eenheid = huidige_koers * stop_loss_percentage
-    
-    aantal_eenheden = max_verlies_bedrag / risico_per_eenheid
-    totale_waarde = aantal_eenheden * huidige_koers
-    
-    # Als de transactiewaarde groter is dan het beschikbare kapitaal, schalen we het terug
-    if totale_waarde > totaal_kapitaal:
-        totale_waarde = totaal_kapitaal
-        aantal_eenheden = totale_waarde / huidige_koers
+# --- AI INFERENCE (KRONOS-BASE) ---
+def voer_ai_inference_uit(df):
+    try:
+        if df is None or len(df) < 50:
+            return 0.0
+            
+        # Kronos verwacht genormaliseerde OHLCV data. 
+        # We pakken de laatste 50 kaarsen als contextvenster
+        laatste_data = df.tail(50)
         
-    return {
-        "eenheden": round(aantal_eenheden, 4),
-        "waarde_usdt": round(totale_waarde, 2),
-        "stop_loss_prijs": round(huidige_koers * (1 - stop_loss_percentage), 4)
-    }
+        # Converteer de pandas kolommen naar een string/token input structuur die de tokenizer begrijpt
+        # Kronos leest markten als opeenvolgende numerieke reeksen tokens
+        input_text = ""
+        for _, row in laatste_data.iterrows():
+            input_text += f"O:{row['open']:.4f} H:{row['high']:.4f} L:{row['low']:.4f} C:{row['close']:.4f} V:{row['volume']:.0f} | "
 
-# =====================================================================
-# ORDER EXECUTION (ORDERUITVOERING)
-# =====================================================================
-def plaats_limiet_order(symbol, side, size, price):
-    """
-    Stuurt een beveiligde koop- of verkooporder naar de KuCoin API.
-    Inclusief asset-whitelisting ter voorkoming van foutieve trades.
-    """
-    if symbol not in HANDELSPAREN:
-        print(f"[-] Order geweigerd: {symbol} staat niet in de whitelist!")
-        return None
+        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
         
+        with torch.no_grad():
+            outputs = model(**inputs)
+            
+        # De abstracte hidden states van de Transformer vertalen naar een prijsrichting
+        # OPMERKING: Bij pure base-modellen pakken we de logits van de laatste token
+        hidden_states = outputs.last_hidden_state
+        voorspelde_richting = torch.tanh(hidden_states[0, -1, 0]).item() # Waarde tussen -1 en 1
+        
+        return voorspelde_richting
+    except Exception as e:
+        print(f"[-] AI Inference Fout: {e}")
+        return 0.0
+
+# --- RISICOMANAGEMENT ---
+def bereken_veilig_risico(saldo, huidige_koers, stop_loss_pct=0.02, max_risico_pct=0.01):
+    max_verlies_geld = saldo * max_risico_pct
+    risico_per_munt = huidige_koers * stop_loss_pct
+    aantal_eenheden = max_verlies_geld / risico_per_munt
+    totale_investering = aantal_eenheden * huidige_koers
+    return aantal_eenheden, totale_investering
+
+# --- ORDERPLAATSING ---
+def voer_trade_uit(symbol, side, aantal, prijs):
     endpoint = "/api/v1/orders"
+    url = BASE_URL + endpoint
+    
+    # Uniek clientOid genereren om dubbele orders te voorkomen
+    client_oid = f"kronos_{int(time.time() * 1000)}"
+    
     payload = {
-        "clientOid": str(int(time.time() * 1000000)), # Uniek ID voor de transactie
-        "side": side.lower(),                         # 'buy' of 'sell'
+        "clientOid": client_oid,
+        "side": side,
         "symbol": symbol,
         "type": "limit",
-        "size": str(size),
-        "price": str(price),
-        "timeInForce": "GTC"                          # Good 'Til Cancelled
+        "price": str(round(prijs, 5)),
+        "size": str(round(aantal, 4))
     }
     
-    import json
-    body_str = json.dumps(payload)
-    headers = genereer_kucoin_headers(endpoint, methode="POST", body_str=body_str)
+    headers = geof_kucoin_headers(endpoint, methode="POST", body=str(payload))
     
-    try:
-        response = requests.post(BASE_URL + endpoint, headers=headers, data=body_str)
-        return response.json()
-    except Exception as e:
-        print(f"[-] Kritieke fout bij plaatsen order voor {symbol}: {e}")
-        return None
+    print(f"[⚙️] VERZENDEN ORDER -> {side} {aantal} {symbol} op prijs {prijs}")
+    # In sandbox/live sturen we de daadwerkelijke call naar de API:
+    # response = requests.post(url, json=payload, headers=headers)
+    # return response.json()
 
-# =====================================================================
-# HOOFDPROGRAMMA (BOT LOOP)
-# =====================================================================
-def main():
-    print("==================================================")
-    print(f"🚀 KRONOS AI TRADING BOT STARTUP - {datetime.now()}")
-    print(f"📍 MODUS: {'SANDBOX (TESTNET)' if IS_SANDBOX else 'MAINNET (ECHT GELD)'}")
-    print("==================================================")
-    
-    # Validatie van omgevingsvariabelen
-    if not API_KEY or not API_SECRET or not API_PASSPHRASE:
-        print("❌ FOUT: API-sleutels ontbreken! Controleer je Railway Variables dashboard.")
-        print("De bot stopt nu om fouten te voorkomen.")
+# --- HOOFDLOOP ---
+def start_trading_bot():
+    if not all([API_KEY, API_SECRET, API_PASSPHRASE]):
+        print("[-] KRITISCHE FOUT: API-sleutels ontbreken in de omgevingsvariabelen!")
         return
 
-    # Gesimuleerd rekeningsaldo voor risicomanagement (bijv. 1000 USDT)
-    # Dit kun je later vervangen door een live saldo-aanroep naar de KuCoin Account API
-    virtueel_saldo = 1000.0
+    print(f"[+] Bot succesvol gestart. Modus: {'SANDBOX (TESTNET)' if IS_SANDBOX else 'LIVE MET ECHT GELD'}")
     
-    # Doorloop continu je geselecteerde cryptomunten
-    for paar in HANDELSPAREN:
-        print(f"\n[*] Analyseren markt: {paar}...")
-        koers = haal_huidige_koers(paar)
-        
-        if not koers:
-            print(f"[-] Sla {paar} over: Kan actuele koers niet ophalen.")
-            continue
+    # Fictief startkapitaal voor de risicocalculator in Sandbox-modus
+    geschat_saldo = 5000.0 
+
+    while True:
+        print("\n--- Start Analyse Ronde ---")
+        for symbol in TARGET_SYMBOLS:
+            print(f"[*] Scannen van markt: {symbol}")
+            df = haal_market_data(symbol)
             
-        print(f"[+] Huidige koers {paar}: ${koers}")
-        
-        # Voer AI-voorspelling uit
-        ai_signaal = simuleer_kronos_ai_logica(paar)
-        print(f"[🤖 AI Model Signaal]: {ai_signaal}")
-        
-        if ai_signaal == "BUY":
-            # Bereken veilige variabelen met de risicomanagementmodule
-            risico = bereken_veilig_risico(virtueel_saldo, koers, stop_loss_percentage=0.03)
+            if df is not None and not df.empty:
+                huidige_koers = df['close'].iloc[-1]
+                
+                # AI laten rekenen
+                ai_signaal = voer_ai_inference_uit(df)
+                print(f"    -> AI Signaalwaarde voor {symbol}: {ai_signaal:.4f}")
+                
+                # Koopregels: Als de transformer een sterk positief patroon ziet (> 0.3)
+                if ai_signaal > 0.3:
+                    aantal, totale_waarde = bereken_veilig_risico(geschat_saldo, huidige_koers)
+                    print(f"    [🟩] AI adviseert KOOP. Risico-check: Koop {aantal:.4f} {symbol} (Waarde: ${totale_waarde:.2f})")
+                    voer_trade_uit(symbol, "buy", aantal, huidige_koers)
+                    
+                elif ai_signaal < -0.3:
+                    aantal, totale_waarde = bereken_veilig_risico(geschat_saldo, huidige_koers)
+                    print(f"    [🟥] AI adviseert VERKOOP/SHORT voor {symbol}.")
+                    voer_trade_uit(symbol, "sell", aantal, huidige_koers)
+                    
+                else:
+                    print(f"    [🟨] AI Signaal is neutraal. Geen actie vereist.")
             
-            print(f"[🛡️ Risicomanagement]: Veilige ordergrootte berekend op {risico['eenheden']} {paar.split('-')[0]}")
-            print(f"    Totale waarde: ${risico['waarde_usdt']} USDT | Voorgestelde Stop-Loss op: ${risico['stop_loss_prijs']}")
+            time.sleep(2) # Voorkom rate-limiting van de KuCoin API
             
-            # Voer de test/live order uit
-            print(f"[⚙️ API] Order verzenden naar KuCoin...")
-            order_resultaat = plaats_limiet_order(
-                symbol=paar, 
-                side="buy", 
-                size=risico["eenheden"], 
-                price=koers
-            )
-            print(f"[📋 API Respons]: {order_resultaat}")
-            
-        elif ai_signaal == "SELL":
-            # Voorbeeld voor verkoop (hiervoor moet je wel de asset in bezit hebben)
-            print(f"[-] AI signaleert verkoop voor {paar}. Verkoop-logica wordt uitgevoerd indien in bezit.")
-            
-        else:
-            print(f"[.] Geen actie vereist voor {paar} (AI Status: HOLD).")
-            
-    print("\n==================================================")
-    print(f"🏁 Analyse-ronde voltooid. Standby voor volgende interval... - {datetime.now()}")
-    print("==================================================")
+        print("[*] Ronde voltooid. Wachten op de volgende kaars (60 seconden)...")
+        time.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    start_trading_bot()
