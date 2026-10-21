@@ -2,6 +2,6 @@ services:
   - type: worker
     name: kucoin-kronos-base-bot
     env: python
-    plan: standard # Dit activeert het vereiste plan met 1 vCPU en 2 GB RAM ($25/maand)
+    plan: standard
     buildCommand: pip install -r requirements.txt
-    startCommand: KB.py
+    startCommand: python KB.py  # <-- Zorg dat dit hier zo staat!
