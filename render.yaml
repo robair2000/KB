@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: kucoin-kronos-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MODE
+        value: paper
+      - key: KRONOS_MODEL
+        value: small
+      - key: STATE_PATH
+        value: /data/state.json
+      - key: KUCOIN_API_KEY
+        sync: false
+      - key: KUCOIN_API_SECRET
+        sync: false
+      - key: KUCOIN_PASSPHRASE
+        sync: false
