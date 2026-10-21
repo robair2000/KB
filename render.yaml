@@ -1,7 +1,9 @@
 services:
-  - type: worker
-    name: kucoin-kronos-base-bot
+  - type: web
+    name: kucoin-kronos-free-bot
     env: python
     plan: free
+    numInstances: 1
     buildCommand: pip install -r requirements.txt
-    startCommand: python KB.py  # <-- Zorg dat dit hier zo staat!
+    startCommand: python -m http.server $PORT & python KB.py
+
