@@ -1,9 +1,8 @@
---extra-index-url https://pytorch.org
-torch
-transformers>=4.40.0
-requests>=2.31.0
-pandas>=2.2.0
-numpy>=1.26.0
-sentencepiece
-protobuf==3.20.3
-tiktoken
+services:
+  - type: web          # <-- Veranderd van worker naar web
+    name: kucoin-kronos-free-bot
+    env: python
+    plan: free
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m http.server $PORT & python KB.py  # <-- Start een gratis mini-webserver én je bot tegelijk!
