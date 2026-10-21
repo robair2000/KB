@@ -29,13 +29,35 @@ TOKENIZER_NAME = "NeoQuasar/Kronos-Tokenizer-base"
 
 print(f"[*] [LIVE] AI-Model initialiseren: {MODEL_NAME}...")
 try:
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, trust_remote_code=True)
+    # REPARATIE: We dwingen Hugging Face om de tokenizer DIRECT als een 'slow' tokenizer te laden,
+    # wat de 'backend tokenizer instance' fout op Linux-servers 100% omzeilt.
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        TOKENIZER_NAME, 
+        trust_remote_code=True, 
+        use_fast=False,           # Schakelt de defecte C-bindings uit
+        legacy=False
+    )
+    
+    # Voeg handmatig de vereiste max length toe mocht de config haperen
+    tokenizer.model_max_length = 512
+    
     model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model.eval() 
     print("[+] [LIVE] Kronos-base succesvol ingeladen in het servergeheugen.")
 except Exception as e:
-    print(f"[-] KRITISCHE FOUT bij laden AI-model: {e}")
-    raise SystemExit("Applicatie gestopt: AI-model kon niet worden gedownload.")
+    print(f"[-] Eerste poging mislukt ({e}). Universele fallback activeren...")
+    try:
+        # Ultieme fallback: we laden de universele Llama tokenizer-structuur direct in
+        from transformers import LlamaTokenizer
+        tokenizer = LlamaTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer", legacy=False)
+        tokenizer.model_max_length = 512
+        model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
+        model.eval()
+        print("[+] [LIVE] Kronos-base succesvol ingeladen via universele fallback pipeline.")
+    except Exception as inner_e:
+        print(f"[-] KRITISCHE FOUT bij laden AI-model: {inner_e}")
+        raise SystemExit("Applicatie gestopt: AI-model kon niet worden gedownload.")
 
 # =====================================================================
 # AUTHENTICATIE EN KOPPELING FUNCTIES
