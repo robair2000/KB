@@ -25,35 +25,52 @@ def to_contract(pair):
     return ("XBT" if base == "BTC" else base) + "USDTM"
 
 
+KLINE_PAGE = 200          # candles per request; KuCoin may return fewer than asked for wide ranges
+
+
 def fetch_futures_candles(contract, interval="1hour", n=450, end_ts=None, session=requests):
     """Last `n` CLOSED candles, oldest -> newest. Same columns as spot fetch_candles.
-    `amount` is approximated as volume * close (futures klines carry no turnover)."""
+    `amount` is approximated as volume * close (futures klines carry no turnover).
+
+    Pages backwards in KLINE_PAGE-candle windows and then checks that the newest candle is the one
+    that just closed and that there are no holes. Stale or gappy data raises an error, so the bot
+    skips that coin instead of forecasting / trading on old prices."""
     step = STEP_SECONDS[interval]
     end_ts = int(end_ts or time.time())
-    rows, cursor = [], end_ts * 1000
-    for _ in range(12):
+    rows, cursor = {}, end_ts * 1000
+    for _ in range(n // KLINE_PAGE + 4):
         if len(rows) >= n + 2:
             break
         r = session.get(FUT_BASE + "/api/v1/kline/query", timeout=20,
                         params={"symbol": contract, "granularity": GRANULARITY_MIN[interval],
-                                "from": cursor - 500 * step * 1000, "to": cursor})
+                                "from": cursor - KLINE_PAGE * step * 1000, "to": cursor})
         r.raise_for_status()
         data = r.json().get("data") or []
         if not data:
             break
-        rows.extend(data)
-        cursor = min(int(x[0]) for x in data) - 1
+        for x in data:
+            rows[int(x[0])] = x
+        oldest = min(int(x[0]) for x in data)
+        cursor = min(oldest, cursor - KLINE_PAGE * step * 1000) - 1
     if not rows:
         raise RuntimeError(f"No futures candles for {contract}")
-    df = pd.DataFrame([x[:6] for x in rows], columns=["t", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame([x[:6] for x in rows.values()], columns=["t", "open", "high", "low", "close", "volume"])
     for c in df.columns:
         df[c] = pd.to_numeric(df[c])
     df["t"] = (df["t"] // 1000).astype("int64")
     df = df.drop_duplicates("t").sort_values("t")
-    df = df[df["t"] + step <= end_ts]
+    df = df[df["t"] + step <= end_ts].tail(n)
+    expected_last = (end_ts // step) * step - step              # open time of the candle that just closed
+    if df.empty or int(df["t"].iloc[-1]) < expected_last:
+        last = "none" if df.empty else pd.to_datetime(int(df["t"].iloc[-1]), unit="s").strftime("%m-%d %H:%M")
+        raise RuntimeError(f"stale candles for {contract}: newest is {last} UTC, expected "
+                           f"{pd.to_datetime(expected_last, unit='s'):%m-%d %H:%M} UTC - coin skipped this cycle")
+    recent = df["t"].values[-min(len(df), 60):]
+    if len(recent) > 1 and (recent[1:] - recent[:-1] != step).any():
+        raise RuntimeError(f"gaps in recent candles for {contract} - coin skipped this cycle")
     df["timestamps"] = pd.to_datetime(df["t"], unit="s")
     df["amount"] = df["volume"] * df["close"]
-    return df[["timestamps", "open", "high", "low", "close", "volume", "amount"]].tail(n).reset_index(drop=True)
+    return df[["timestamps", "open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
 
 
 def contract_info(contract, session=requests):
