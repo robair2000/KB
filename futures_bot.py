@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime, timezone
 
+import filters
 from fkucoin import STEP_SECONDS, FuturesLive, fetch_futures_candles, to_contract
 from futures_rules import (FUNDING_8H, FUT_FEE, MAX_LEVERAGE, MAX_MARGIN_FRAC, MAX_TOTAL_LEVERAGE,
                            MMR, choose_leverage_and_notional, target_action)
@@ -236,8 +237,16 @@ def run_cycle(state, predictor, broker, fetch=fetch_futures_candles):
             pos = state["positions"].get(sym)
             er = expected_return(predictor, c, PRED_LEN, SAMPLES)
             exit_now, enter_dir = target_action(er, pos["dir"] if pos else 0, ENTRY_THRESHOLD)
+            ctx = None              # RSI / open-interest readings (filters.py); OI also logs spikes
+            if filters.OI_FILTER or enter_dir:
+                ctx = filters.evaluate(sym, c, STEP_SECONDS[INTERVAL])
             log(f"{sym}: price {price:.4f} | forecast {er:+.2%} | "
-                f"{'EXIT ' if exit_now else ''}{('LONG' if enter_dir == 1 else 'SHORT') if enter_dir else ('HOLD' if not exit_now else '')}")
+                f"{'EXIT ' if exit_now else ''}{('LONG' if enter_dir == 1 else 'SHORT') if enter_dir else ('HOLD' if not exit_now else '')}"
+                + (f" | {filters.describe(ctx)}" if ctx else ""))
+            why = filters.entry_block(enter_dir, ctx) if enter_dir else None
+            if why:                 # exit above still happens; only the new entry is vetoed
+                log(f"{sym}: {'LONG' if enter_dir == 1 else 'SHORT'} entry blocked: {why}")
+                enter_dir = 0
             if pos and exit_now:
                 fill, pnl = broker.close(state, sym, price, "signal")
                 log(f"{sym}: closed on signal ({pnl:+.2%})")
@@ -278,6 +287,7 @@ def main():
     else:
         log("PAPER FUTURES MODE: simulated fills only")
         broker = PaperFutures()
+    log(f"entry filters: {filters.summary()}")
     log(f"limits: max leverage {MAX_LEVERAGE}x | max total exposure {MAX_TOTAL_LEVERAGE}x equity | "
         f"margin/position <= {MAX_MARGIN_FRAC:.0%} | stop {STOP_PCT:.0%} | daily loss limit {DAILY_LOSS_LIMIT:.0%}")
     predictor = load_predictor()

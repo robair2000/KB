@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime, timezone
 
+import filters
 from kucoin import INTERVAL_SECONDS, KuCoinLive, fetch_candles
 from strategy import decide, expected_return, load_predictor
 
@@ -136,11 +137,19 @@ def run_cycle(state, predictor, broker):
             # 2) Kronos forecast
             er = expected_return(predictor, c, PRED_LEN, SAMPLES)
             action = decide(er, ENTRY_THRESHOLD)
-            log(f"{sym}: price {price:.4f} | forecast {er:+.2%} over {PRED_LEN} candles | {action}")
+            ctx = None              # RSI / open-interest readings (filters.py); OI also logs spikes
+            if filters.OI_FILTER or (not pos and action == "ENTER"):
+                ctx = filters.evaluate(sym, c, INTERVAL_SECONDS[INTERVAL])
+            log(f"{sym}: price {price:.4f} | forecast {er:+.2%} over {PRED_LEN} candles | {action}"
+                + (f" | {filters.describe(ctx)}" if ctx else ""))
             if pos and action == "EXIT":
                 fill, pnl = broker.sell(state, sym, price, "signal")
                 log(f"{sym}: SOLD on signal @ {fill:.4f} ({pnl:+.2%})")
             elif not pos and action == "ENTER":
+                why = filters.entry_block(1, ctx)
+                if why:
+                    log(f"{sym}: entry blocked: {why}")
+                    continue
                 if halted or len(state["positions"]) >= MAX_POSITIONS:
                     log(f"{sym}: entry skipped (limit reached)")
                     continue
@@ -167,6 +176,7 @@ def main():
         log("*** LIVE MODE: real orders will be placed ***")
     else:
         log("PAPER MODE: simulated fills only")
+    log(f"entry filters: {filters.summary()}")
     predictor = load_predictor()
     broker = Broker(MODE)
     state = load_state()
