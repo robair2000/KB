@@ -12,7 +12,7 @@ import filters
 from fkucoin import STEP_SECONDS, FuturesLive, fetch_futures_candles, to_contract
 from futures_rules import (FUNDING_8H, FUT_FEE, MAX_LEVERAGE, MAX_MARGIN_FRAC, MAX_TOTAL_LEVERAGE,
                            MMR, choose_leverage_and_notional, target_action)
-from strategy import expected_return, load_predictor
+from strategy import expected_return, expected_returns, load_predictor
 
 PAIRS = [p.strip() for p in os.getenv("PAIRS", "BTC-USDT,ETH-USDT,SOL-USDT,LINK-USDT,DOGE-USDT").split(",")]
 MODE = os.getenv("MODE", "paper").lower()
@@ -29,6 +29,10 @@ DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.03"))
 START_CASH = float(os.getenv("START_CASH", "1000"))
 MIN_NOTIONAL = 10.0
 STATE_PATH = os.getenv("STATE_PATH_FUTURES", "state_futures.json")
+COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "2"))          # after a stop / losing close: no re-entry on that coin
+COOLDOWN_ANY_SIDE = os.getenv("COOLDOWN_ANY_SIDE", "false").lower() in ("1", "true", "yes")  # false = same side only
+MAX_SAME_SIDE = int(os.getenv("MAX_SAME_SIDE", "3"))          # max open longs (and max open shorts); 0 = no cap
+EXCHANGE_TP = os.getenv("EXCHANGE_TP", "true").lower() in ("1", "true", "yes")  # take-profit order on KuCoin
 
 
 def log(msg):
@@ -66,10 +70,30 @@ def used_margin(state, prices):
     return sum(p["qty"] * prices.get(s, p["entry"]) / p["lev"] for s, p in state["positions"].items())
 
 
+def start_cooldown(state, sym, pos, pnl_pct, reason):
+    """After a stop or a losing close, block re-entry on that coin for COOLDOWN_BARS candles."""
+    if COOLDOWN_BARS <= 0 or (pnl_pct >= 0 and "stop" not in reason):
+        return
+    until = time.time() + COOLDOWN_BARS * STEP_SECONDS[INTERVAL]
+    state.setdefault("cooldown", {})[sym] = {"until": until, "dir": pos["dir"]}
+    log(f"{sym}: cooldown {COOLDOWN_BARS} candle(s) for {'any side' if COOLDOWN_ANY_SIDE else ('LONG' if pos['dir'] == 1 else 'SHORT')} "
+        f"after {reason} ({pnl_pct:+.2%})")
+
+
+def cooldown_block(state, sym, d):
+    cd = state.get("cooldown", {}).get(sym)
+    if not cd or time.time() >= cd["until"]:
+        return None
+    if COOLDOWN_ANY_SIDE or cd["dir"] == d:
+        return f"cooldown after a loss ({(cd['until'] - time.time()) / 60:.0f} min left)"
+    return None
+
+
 def record_trade(state, sym, pos, exit_price, reason):
     state["trades"].append({"symbol": sym, "dir": pos["dir"], "lev": pos["lev"], "entry": pos["entry"],
                             "exit": exit_price, "pnl_pct": pos["dir"] * (exit_price / pos["entry"] - 1) - 2 * FUT_FEE,
                             "reason": reason, "closed": datetime.now(timezone.utc).isoformat()})
+    start_cooldown(state, sym, pos, state["trades"][-1]["pnl_pct"], reason)
 
 
 # ------------------------------------------------------------------ brokers
@@ -120,17 +144,39 @@ class LiveFutures:
         mult = self.api.info(sym)["multiplier"]
         state["positions"][sym] = {"dir": d, "qty": open_lots * mult, "lots": open_lots, "entry": entry,
                                    "lev": lev, "stop": stop, "take": take, "stop_order_id": stop_id,
-                                   "opened_candle": opened_candle}
+                                   "take_order_id": None, "opened_candle": opened_candle}
+        self.place_take(sym, state["positions"][sym])
         return state["positions"][sym]
+
+    def place_take(self, sym, pos):
+        """Take-profit-market on KuCoin, so it fills the moment price gets there (not at the next hourly check)."""
+        if not EXCHANGE_TP:
+            return
+        try:
+            pos["take_order_id"] = self.api.exchange_take(sym, pos["dir"], pos["lots"], pos["lev"], pos["take"])["orderId"]
+            log(f"{sym}: take-profit order on exchange @ {pos['take']:.4f}")
+        except Exception as e:
+            pos["take_order_id"] = None
+            log(f"{sym}: take-profit order failed, using the hourly software take-profit instead: {e}")
+
+    def tidy(self, sym, pos):
+        """Remove the leftover stop / take-profit after a position is gone (they must not hit a later position)."""
+        for k in ("stop_order_id", "take_order_id"):
+            if pos.get(k):
+                try:
+                    self.api.cancel(pos[k])
+                except Exception:
+                    pass
+        try:
+            self.api.cancel_stop_orders(sym)
+        except Exception as e:
+            log(f"{sym}: could not clear leftover stop orders: {e}")
 
     def close(self, state, sym, price, reason):
         pos = state["positions"][sym]
         self.api.market(sym, "sell" if pos["dir"] == 1 else "buy", pos["lots"], pos["lev"], reduce_only=True)
-        state["positions"].pop(sym)                      # closed -> forget, then tidy the stop order
-        try:
-            self.api.cancel(pos["stop_order_id"])
-        except Exception as e:
-            log(f"{sym}: could not cancel stop order (harmless, reduce-only): {e}")
+        state["positions"].pop(sym)                      # closed -> forget, then tidy the stop / TP orders
+        self.tidy(sym, pos)
         record_trade(state, sym, pos, price, reason)
         return price, state["trades"][-1]["pnl_pct"]
 
@@ -177,15 +223,20 @@ def live_sync(state, candles, broker):
     for sym in list(state["positions"]):
         if sym not in ex:
             pos = state["positions"].pop(sym)
+            broker.tidy(sym, pos)
             last = float(candles[sym]["close"].iloc[-1]) if sym in candles else pos["entry"]
-            record_trade(state, sym, pos, last, "closed on exchange (stop/liquidation/manual)")
-            log(f"{sym}: position no longer on exchange -> recorded as closed")
+            won = pos["dir"] * (last - pos["entry"]) > 0
+            reason = "take-profit on exchange" if won else "stop on exchange (or liquidation/manual)"
+            record_trade(state, sym, pos, pos["take"] if won else pos["stop"], reason)
+            log(f"{sym}: position no longer on exchange -> recorded as {reason}")
+        elif EXCHANGE_TP and not state["positions"][sym].get("take_order_id"):
+            broker.place_take(sym, state["positions"][sym])          # positions opened before this version
     untracked = [s for s in ex if s not in state["positions"]]
     if untracked:
         log(f"WARNING: positions on the exchange that this bot did not open (left untouched): {untracked}")
-    for sym in list(state["positions"]):                 # software take-profit
+    for sym in list(state["positions"]):                 # software take-profit (only if no TP order on KuCoin)
         c = candles.get(sym)
-        if c is None:
+        if c is None or state["positions"][sym].get("take_order_id"):
             continue
         pos, row = state["positions"][sym], c.iloc[-1]
         if str(row["timestamps"]) <= pos["opened_candle"]:
@@ -228,14 +279,25 @@ def run_cycle(state, predictor, broker, fetch=fetch_futures_candles):
         f"| open {[(s, p['dir'], p['lev']) for s, p in state['positions'].items()]}"
         + ("  ** DAILY LOSS LIMIT: no new entries **" if halted else ""))
 
-    for pair in PAIRS:
-        sym = to_contract(pair)
-        if sym not in candles:
-            continue
-        c, price = candles[sym], prices[sym]
+    # 1) forecast every coin in one batch, so all decisions are made right after the candle close
+    t0 = time.time()
+    try:
+        forecasts = expected_returns(predictor, candles, PRED_LEN, SAMPLES)
+    except Exception as e:
+        log(f"batch forecast failed ({e}), forecasting coin by coin")
+        forecasts = {}
+        for sym, c in candles.items():
+            try:
+                forecasts[sym] = expected_return(predictor, c, PRED_LEN, SAMPLES)
+            except Exception as e2:
+                log(f"{sym}: forecast error: {e2}")
+    log(f"forecast {len(forecasts)} coins in {time.time() - t0:.0f}s")
+
+    # 2) decide, strongest forecast first (so the best signals get the free slots)
+    for sym in sorted(forecasts, key=lambda s: -abs(forecasts[s])):
+        c, price, er = candles[sym], prices[sym], forecasts[sym]
         try:
             pos = state["positions"].get(sym)
-            er = expected_return(predictor, c, PRED_LEN, SAMPLES)
             exit_now, enter_dir = target_action(er, pos["dir"] if pos else 0, ENTRY_THRESHOLD)
             ctx = None              # RSI / open-interest readings (filters.py); OI also logs spikes
             if filters.OI_FILTER or enter_dir:
@@ -243,7 +305,7 @@ def run_cycle(state, predictor, broker, fetch=fetch_futures_candles):
             log(f"{sym}: price {price:.4f} | forecast {er:+.2%} | "
                 f"{'EXIT ' if exit_now else ''}{('LONG' if enter_dir == 1 else 'SHORT') if enter_dir else ('HOLD' if not exit_now else '')}"
                 + (f" | {filters.describe(ctx)}" if ctx else ""))
-            why = filters.entry_block(enter_dir, ctx) if enter_dir else None
+            why = (cooldown_block(state, sym, enter_dir) or filters.entry_block(enter_dir, ctx)) if enter_dir else None
             if why:                 # exit above still happens; only the new entry is vetoed
                 log(f"{sym}: {'LONG' if enter_dir == 1 else 'SHORT'} entry blocked: {why}")
                 enter_dir = 0
@@ -258,6 +320,10 @@ def run_cycle(state, predictor, broker, fetch=fetch_futures_candles):
             if enter_dir and sym not in untracked:
                 if halted or len(state["positions"]) >= MAX_POSITIONS:
                     log(f"{sym}: entry skipped (limit reached)")
+                    continue
+                same = sum(1 for p in state["positions"].values() if p["dir"] == enter_dir)
+                if MAX_SAME_SIDE and same >= MAX_SAME_SIDE:
+                    log(f"{sym}: entry skipped (already {same} {'longs' if enter_dir == 1 else 'shorts'}, MAX_SAME_SIDE)")
                     continue
                 plan = choose_leverage_and_notional(equity, exposure(state, prices), er,
                                                     ENTRY_THRESHOLD, STOP_PCT, RISK_FRAC)
@@ -287,7 +353,8 @@ def main():
     else:
         log("PAPER FUTURES MODE: simulated fills only")
         broker = PaperFutures()
-    log(f"entry filters: {filters.summary()}")
+    log(f"entry filters: {filters.summary()} | cooldown {COOLDOWN_BARS}c after a loss | "
+        f"max {MAX_SAME_SIDE or 'unlimited'} per side | take-profit {'on exchange' if EXCHANGE_TP else 'software'}")
     log(f"limits: max leverage {MAX_LEVERAGE}x | max total exposure {MAX_TOTAL_LEVERAGE}x equity | "
         f"margin/position <= {MAX_MARGIN_FRAC:.0%} | stop {STOP_PCT:.0%} | daily loss limit {DAILY_LOSS_LIMIT:.0%}")
     predictor = load_predictor()
