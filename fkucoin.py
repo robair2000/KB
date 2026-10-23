@@ -137,5 +137,19 @@ class FuturesLive:
             "size": int(lots), "leverage": int(leverage), "marginMode": "CROSS",
             "positionSide": "BOTH", "reduceOnly": True})
 
+    def exchange_take(self, contract, direction, lots, leverage, take_price):
+        """Protective reduce-only market take-profit that lives on the exchange."""
+        return self._call("POST", "/api/v1/orders", {
+            "clientOid": str(int(time.time() * 1e6)), "symbol": contract,
+            "side": "sell" if direction == 1 else "buy", "type": "market",
+            "stop": "up" if direction == 1 else "down", "stopPriceType": "TP",
+            "stopPrice": str(self.round_price(contract, take_price)),
+            "size": int(lots), "leverage": int(leverage), "marginMode": "CROSS",
+            "positionSide": "BOTH", "reduceOnly": True})
+
     def cancel(self, order_id):
         return self._call("DELETE", f"/api/v1/orders/{order_id}")
+
+    def cancel_stop_orders(self, contract):
+        """Cancel every untriggered stop / take-profit order on a contract (leftovers after a close)."""
+        return self._call("DELETE", f"/api/v1/stopOrders?symbol={contract}")
