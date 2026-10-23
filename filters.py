@@ -4,6 +4,8 @@ Kronos only sees OHLCV. These rules can VETO a new entry; they never close a pos
 on the forecast still happens. Every blocked entry is logged with its reason.
 
   RSI            no new long above RSI_LONG_MAX, no new short below RSI_SHORT_MIN
+  Momentum       no new short after price rose more than MOM_MAX_PCT over the last MOM_BARS candles,
+                 no new long after it fell more than that (don't fight a move that is under way)
   OI positioning no long while price fell and OI rose >= OI_MIN_CHANGE over OI_LOOKBACK_BARS
                  candles (shorts building); no short while price rose and OI rose (longs building)
   OI spike       a one-candle OI change OI_SPIKE_Z std devs away from that coin's own last
@@ -38,6 +40,10 @@ RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "75"))
 RSI_SHORT_MIN = float(os.getenv("RSI_SHORT_MIN", "25"))
 
+MOM_FILTER = _b("MOM_FILTER", "true")
+MOM_BARS = int(os.getenv("MOM_BARS", "4"))
+MOM_MAX_PCT = float(os.getenv("MOM_MAX_PCT", "0.02"))
+
 OI_FILTER = _b("OI_FILTER", "true")
 OI_EXCHANGE = os.getenv("OI_EXCHANGE", "binance").strip().lower()      # binance | bybit
 OI_PERIOD = os.getenv("OI_PERIOD", "5m")                                # 5m | 15m | 30m | 1h
@@ -62,6 +68,8 @@ def summary():
     on = []
     if RSI_FILTER:
         on.append(f"RSI{RSI_PERIOD} (long<={RSI_LONG_MAX:g}, short>={RSI_SHORT_MIN:g})")
+    if MOM_FILTER:
+        on.append(f"momentum (no trade against a {MOM_MAX_PCT:.0%}+ move over {MOM_BARS}c)")
     if OI_FILTER:
         on.append(f"OI via {OI_EXCHANGE} (build {OI_MIN_CHANGE:.0%}/{OI_LOOKBACK_BARS}c, spikes {OI_SPIKE_MODE})")
     return ", ".join(on) or "none"
@@ -223,7 +231,8 @@ def context(candles, oi, step_seconds):
     n = OI_LOOKBACK_BARS
     ctx = dict(rsi=float(rsi(close, RSI_PERIOD).iloc[-1]),
                px_chg=float(close.iloc[-1] / close.iloc[-1 - n] - 1) if len(close) > n else None,
-               oi_chg=None, oi_spike=None, oi_ok=False)
+               oi_chg=None, oi_spike=None, oi_ok=False,
+               mom_chg=float(close.iloc[-1] / close.iloc[-1 - MOM_BARS] - 1) if len(close) > MOM_BARS else None)
     if oi is not None and len(oi):
         tf = int(step_seconds) * 1000
         m = min(len(candles), bars_needed() + 1)
@@ -272,6 +281,12 @@ def entry_block(direction, ctx):
             return f"RSI {r:.0f} > {RSI_LONG_MAX:g}"
         if direction == -1 and r < RSI_SHORT_MIN:
             return f"RSI {r:.0f} < {RSI_SHORT_MIN:g}"
+    m = ctx.get("mom_chg")
+    if MOM_FILTER and m is not None:
+        if direction == -1 and m > MOM_MAX_PCT:
+            return f"price up {m:+.1%} over {MOM_BARS} candles (no short into a rally)"
+        if direction == 1 and m < -MOM_MAX_PCT:
+            return f"price down {m:+.1%} over {MOM_BARS} candles (no long into a drop)"
     if OI_FILTER:
         if not ctx.get("oi_ok"):
             return "no OI data" if OI_REQUIRED else None
@@ -310,6 +325,8 @@ def describe(ctx):
     parts = []
     if ctx.get("rsi") is not None and not math.isnan(ctx["rsi"]):
         parts.append(f"RSI {ctx['rsi']:.0f}")
+    if ctx.get("mom_chg") is not None:
+        parts.append(f"{MOM_BARS}c {ctx['mom_chg']:+.1%}")
     if ctx.get("oi_chg") is not None:
         parts.append(f"OI {OI_LOOKBACK_BARS}c {ctx['oi_chg']:+.1%}")
     return " | ".join(parts)
