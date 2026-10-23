@@ -5,11 +5,13 @@
   2. LABELS   once a signal's holding window has passed, its outcome is computed from the candles
               that followed, with the bot's own take-profit / stop / max-hold / fees. Blocked and
               skipped signals are labelled too, so you learn whether the filters actually help.
-  3. TRAINING every RETRAIN_HOURS a small logistic model learns which signals tend to win. It is
-              tested on the most recent data it never saw and only replaces the current model if
-              it beats it there.
-  4. FILTER   LEARNED_FILTER=shadow (default): log the model's win probability, block nothing.
-              LEARNED_FILTER=on: also skip signals below LEARNED_MIN_PROB.
+  3. TRAINING every RETRAIN_HOURS a small regression model learns the EXPECTED RETURN of a signal
+              (net of fees) from its readings. Expected return, not win rate: with small take-profits
+              and wider stops most trades "win", so what matters is how big the losses are.
+              It is tested on the most recent data it never saw and only used if the signals it
+              keeps did better there than taking every signal.
+  4. FILTER   LEARNED_FILTER=shadow (default): log the model's expected return, block nothing.
+              LEARNED_FILTER=on: also skip signals whose expected return is below LEARNED_MIN_EDGE.
               LEARNED_FILTER=off: no model at all (journal + labels still run while LEARN=true).
 
 Files (in LEARN_DIR, default = folder of the bot's state file, i.e. the Render disk):
@@ -37,7 +39,7 @@ def _b(name, default):
 
 LEARN = _b("LEARN", "true")
 LEARNED_FILTER = os.getenv("LEARNED_FILTER", "shadow").strip().lower()      # off | shadow | on
-LEARNED_MIN_PROB = float(os.getenv("LEARNED_MIN_PROB", "0.55"))
+LEARNED_MIN_EDGE = float(os.getenv("LEARNED_MIN_EDGE", "0.0"))     # min expected net return to trade
 RETRAIN_HOURS = float(os.getenv("RETRAIN_HOURS", "168"))
 MIN_TRAIN_SAMPLES = int(os.getenv("MIN_TRAIN_SAMPLES", "500"))
 TRAIN_DAYS = int(os.getenv("TRAIN_DAYS", "60"))
@@ -96,12 +98,14 @@ class Learner:
         self.f_report = os.path.join(self.dir, "report.json")
         self.pending = self._read_json(self.f_pend, [])
         self.model = self._read_json(self.f_model, None) if LEARNED_FILTER != "off" else None
+        if self.model and self.model.get("kind") != "ridge":
+            self.model = None                                  # model from an older learner version
         self._model_mtime = self._mtime(self.f_model)
         if LEARN:
             m = self.model
             _log(f"journal on in {self.dir} | {len(self.pending)} signals awaiting outcome | filter {LEARNED_FILTER}"
-                 + (f" | model from {m['trained_at']} (test AUC {m['test']['auc']:.2f}, n={m['n_train']})" if m else
-                    " | no model yet"))
+                 + (f" | model from {m['trained_at']} (n={m['n_train']}, kept signals "
+                       f"{m['test']['kept_ret']:+.2%} vs all {m['test']['base_ret']:+.2%})" if m else " | no model yet"))
 
     # ----------------------------------------------------------- io helpers --
     @staticmethod
@@ -205,26 +209,24 @@ class Learner:
         if m != self._model_mtime:
             self._model_mtime, self.model = m, self._read_json(self.f_model, None)
 
-    def prob(self, feats):
-        """Model's win probability for a signal, or None when there is no accepted model."""
+    def predict(self, feats):
+        """Model's expected net return for a signal, or None when there is no accepted model."""
         if LEARNED_FILTER == "off":
             return None
         self._refresh_model()
         m = self.model
-        if not m:
+        if not m or m.get("kind") != "ridge":
             return None
         x = np.array([_num(feats.get(f)) if _num(feats.get(f)) is not None else np.nan for f in m["features"]])
-        x = (x - np.array(m["mean"])) / np.array(m["std"])
-        x = np.nan_to_num(x)
-        z = float(m["bias"] + x @ np.array(m["w"]))
-        return 1 / (1 + math.exp(-max(min(z, 30), -30)))
+        x = np.nan_to_num((x - np.array(m["mean"])) / np.array(m["std"]))
+        return float(m["bias"] + x @ np.array(m["w"]))
 
     def gate(self, feats):
-        """(block_reason or None, probability). Blocks only with LEARNED_FILTER=on and an accepted model."""
-        p = self.prob(feats)
-        if LEARNED_FILTER == "on" and p is not None and p < LEARNED_MIN_PROB:
-            return f"learned filter: win chance {p:.0%} < {LEARNED_MIN_PROB:.0%}", p
-        return None, p
+        """(block_reason or None, expected return). Blocks only with LEARNED_FILTER=on and an accepted model."""
+        e = self.predict(feats)
+        if LEARNED_FILTER == "on" and e is not None and e < LEARNED_MIN_EDGE:
+            return f"learned filter: expected return {e:+.2%} < {LEARNED_MIN_EDGE:+.2%}", e
+        return None, e
 
     # -------------------------------------------------------------- training --
     def _dataset(self):
@@ -271,36 +273,30 @@ class Learner:
 
 
 # ---------------------------------------------------------------- training --
-def _auc(y, p):
-    pos, neg = p[y == 1], p[y == 0]
-    if not len(pos) or not len(neg):
-        return 0.5
-    order = np.argsort(np.concatenate([pos, neg]))
-    ranks = np.empty(len(order)); ranks[order] = np.arange(1, len(order) + 1)
-    return float((ranks[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+def _ridge(Z, y, lam):
+    ym = y.mean()
+    w = np.linalg.solve(Z.T @ Z + lam * np.eye(Z.shape[1]), Z.T @ (y - ym))
+    return w, float(ym)
 
 
-def _fit(X, y, l2=1.0, iters=600, lr=0.1):
-    w, b = np.zeros(X.shape[1]), 0.0
-    for _ in range(iters):
-        p = 1 / (1 + np.exp(-np.clip(X @ w + b, -30, 30)))
-        g = p - y
-        w -= lr * (X.T @ g / len(y) + l2 * w / len(y))
-        b -= lr * g.mean()
-    return w, b
+def _rank_corr(a, b):
+    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
+        return 0.0
+    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
+    return float(np.corrcoef(ra, rb)[0, 1])
 
 
-def train(rows, min_prob=None):
-    """rows: [(signal, label)] oldest first. Train on the older 80%, judge on the newest 20%."""
-    min_prob = LEARNED_MIN_PROB if min_prob is None else min_prob
+def train(rows, min_edge=None):
+    """rows: [(signal, label)] oldest first. Fit on the older 80%, judge on the newest 20%."""
+    min_edge = LEARNED_MIN_EDGE if min_edge is None else min_edge
     n = len(rows)
     if n < MIN_TRAIN_SAMPLES:
         return {"accepted": False, "n": n,
                 "summary": f"training skipped: {n}/{MIN_TRAIN_SAMPLES} labelled signals so far"}
     X = np.array([[_num(r["feats"].get(f)) if _num(r["feats"].get(f)) is not None else np.nan
                    for f in FEATURES] for r, _ in rows], dtype=float)
-    y = np.array([1.0 if l["ret"] > 0 else 0.0 for _, l in rows])
     ret = np.array([l["ret"] for _, l in rows])
+    y = np.clip(ret, -0.05, 0.05)                                  # one freak candle shouldn't steer the fit
     cut = int(n * 0.8)
     with warnings.catch_warnings():                  # columns a bot never fills (e.g. KB has no agreement)
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -309,23 +305,29 @@ def train(rows, min_prob=None):
     mean = np.where(np.isnan(mean), 0, mean)
     std = np.where((std > 0) & ~np.isnan(std), std, 1)
     Z = np.nan_to_num((X - mean) / std)
-    w, b = _fit(Z[:cut], y[:cut])
-    p_te = 1 / (1 + np.exp(-np.clip(Z[cut:] @ w + b, -30, 30)))
-    y_te, r_te = y[cut:], ret[cut:]
-    sel = p_te >= min_prob
-    test = {"n": int(len(y_te)), "auc": _auc(y_te, p_te), "base_win": float(y_te.mean()),
+    # shrinkage chosen on the last quarter of the training part (still older than the test part)
+    v = int(cut * 0.75)
+    best = max((_rank_corr(Z[v:cut] @ _ridge(Z[:v], y[:v], lam)[0], ret[v:cut]), lam)
+               for lam in (1.0, 10.0, 100.0, 1000.0))
+    lam = best[1]
+    w, b = _ridge(Z[:cut], y[:cut], lam)
+    e_te, r_te = Z[cut:] @ w + b, ret[cut:]
+    sel = e_te >= min_edge
+    test = {"n": int(len(r_te)), "rank_corr": _rank_corr(e_te, r_te), "base_win": float((r_te > 0).mean()),
             "base_ret": float(r_te.mean()), "kept": int(sel.sum()),
-            "kept_win": float(y_te[sel].mean()) if sel.any() else None,
+            "kept_win": float((r_te[sel] > 0).mean()) if sel.any() else None,
             "kept_ret": float(r_te[sel].mean()) if sel.any() else None}
-    accepted = (test["n"] >= 100 and test["auc"] >= 0.55 and test["kept"] >= 20
-                and test["kept_ret"] is not None and test["kept_ret"] > test["base_ret"])
-    model = {"features": FEATURES, "mean": mean.tolist(), "std": std.tolist(), "w": w.tolist(), "bias": b,
-             "n_train": cut, "test": test, "trained_at": datetime.now(timezone.utc).isoformat(timespec="minutes")}
+    accepted = (test["n"] >= 100 and test["rank_corr"] >= 0.05 and 20 <= test["kept"] < test["n"]
+                and test["kept_ret"] is not None and test["kept_ret"] > test["base_ret"] + 0.0002)
+    model = {"kind": "ridge", "features": FEATURES, "mean": mean.tolist(), "std": std.tolist(), "w": w.tolist(),
+             "bias": b, "lambda": lam, "n_train": cut, "test": test,
+             "trained_at": datetime.now(timezone.utc).isoformat(timespec="minutes")}
     top = sorted(zip(FEATURES, w), key=lambda kv: -abs(kv[1]))[:4]
-    summary = (f"trained on {cut}, tested on {test['n']} newest signals: AUC {test['auc']:.2f} | all: win "
-               f"{test['base_win']:.0%} avg {test['base_ret']:+.2%} | p>={min_prob:.0%}: {test['kept']} kept"
+    summary = (f"trained on {cut}, tested on {test['n']} newest signals: rank corr {test['rank_corr']:+.2f} | all: "
+               f"win {test['base_win']:.0%} avg {test['base_ret']:+.2%} | expected >= {min_edge:+.2%}: "
+               f"{test['kept']} kept"
                + (f", win {test['kept_win']:.0%} avg {test['kept_ret']:+.2%}" if test["kept"] else "")
-               + f" | strongest: {', '.join(f'{k} {v:+.2f}' for k, v in top)} | "
+               + f" | strongest: {', '.join(f'{k} {v * 100:+.2f}%' for k, v in top)} | "
                + ("ACCEPTED" if accepted else "not better than taking every signal - previous model kept"))
     return {"accepted": accepted, "n": n, "test": test, "model": model, "summary": summary}
 

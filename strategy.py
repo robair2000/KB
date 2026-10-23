@@ -47,7 +47,7 @@ def expected_returns(predictor, candles_by_sym, pred_len=6, sample_count=3, look
     so every decision is ready a few minutes after the candle close instead of coin by coin.
     Coins are grouped by history length (predict_batch needs equal lengths).
     """
-    batch = batch or int(os.getenv("FORECAST_BATCH", "16"))
+    batch = batch or int(os.getenv("FORECAST_BATCH", "1"))     # 1 = old memory use; raise on a bigger plan
     prepared = {}
     for sym, candles in candles_by_sym.items():
         x = candles.tail(lookback).reset_index(drop=True)

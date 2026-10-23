@@ -350,7 +350,7 @@ def run_cycle(state, predictor, broker, fetch=fetch_futures_candles):
             if enter_dir and not why:
                 why, jr["p"] = L.gate(jr["feats"])
                 if jr["p"] is not None:
-                    log(f"{sym}: learned win chance {jr['p']:.0%}")
+                    log(f"{sym}: learned expected return {jr['p']:+.2%}")
             if why:                 # exit above still happens; only the new entry is vetoed
                 log(f"{sym}: {'LONG' if enter_dir == 1 else 'SHORT'} entry blocked: {why}")
                 jr["action"] = f"blocked: {why}"
