@@ -8,10 +8,13 @@ import os
 import time
 from datetime import datetime, timezone
 
+import pandas as pd
+
 import filters
 from fkucoin import STEP_SECONDS, FuturesLive, fetch_futures_candles, to_contract
 from futures_rules import (FUNDING_8H, FUT_FEE, MAX_LEVERAGE, MAX_MARGIN_FRAC, MAX_TOTAL_LEVERAGE,
                            MMR, choose_leverage_and_notional, target_action)
+from learner import Learner, make_features
 from strategy import expected_return, expected_returns, load_predictor
 
 PAIRS = [p.strip() for p in os.getenv("PAIRS", "BTC-USDT,ETH-USDT,SOL-USDT,LINK-USDT,DOGE-USDT").split(",")]
@@ -37,6 +40,22 @@ EXCHANGE_TP = os.getenv("EXCHANGE_TP", "true").lower() in ("1", "true", "yes")  
 
 def log(msg):
     print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}Z] {msg}", flush=True)
+
+
+_learner = None
+
+
+def learner():
+    """Signal journal + outcome labels + learned filter (learner.py); lives next to the state file."""
+    global _learner
+    if _learner is None:
+        _learner = Learner("KB", os.getenv("LEARN_DIR") or os.path.dirname(os.path.abspath(STATE_PATH)),
+                           STEP_SECONDS[INTERVAL])
+    return _learner
+
+
+def _open_ms(c):
+    return pd.to_datetime(c["timestamps"]).values.astype("datetime64[ms]").astype("int64")
 
 
 # ------------------------------------------------------------------ state helpers
@@ -293,21 +312,48 @@ def run_cycle(state, predictor, broker, fetch=fetch_futures_candles):
                 log(f"{sym}: forecast error: {e2}")
     log(f"forecast {len(forecasts)} coins in {time.time() - t0:.0f}s")
 
+    # outcomes of earlier signals whose holding window has now passed (learner.py)
+    L = learner()
+    try:
+        n = L.label(candles, _open_ms, fetch=lambda s: fetch(s, INTERVAL, n=120))
+        if n:
+            log(f"learner: labelled {n} past signal(s)")
+    except Exception as e:
+        log(f"learner labelling failed: {e}")
+    journal = []
+
     # 2) decide, strongest forecast first (so the best signals get the free slots)
     for sym in sorted(forecasts, key=lambda s: -abs(forecasts[s])):
         c, price, er = candles[sym], prices[sym], forecasts[sym]
+        side_sig = 1 if er >= ENTRY_THRESHOLD else (-1 if er <= -ENTRY_THRESHOLD else 0)
+        jr = dict(sym=sym, t=int(_open_ms(c)[-1]) + STEP_SECONDS[INTERVAL] * 1000, close=price, side=side_sig,
+                  er=er, tp_pct=TAKE_PCT, sl_pct=STOP_PCT, hold=PRED_LEN, fee=2 * FUT_FEE,
+                  action="signal" if side_sig else "none", p=None, feats={})
+        journal.append(jr)
         try:
             pos = state["positions"].get(sym)
             exit_now, enter_dir = target_action(er, pos["dir"] if pos else 0, ENTRY_THRESHOLD)
             ctx = None              # RSI / open-interest readings (filters.py); OI also logs spikes
             if filters.OI_FILTER or enter_dir:
                 ctx = filters.evaluate(sym, c, STEP_SECONDS[INTERVAL])
+            try:
+                ctx_j = ctx or filters.context(c, None, STEP_SECONDS[INTERVAL])
+            except Exception:
+                ctx_j = {}
+            jr["feats"] = make_features(side_sig or (1 if er >= 0 else -1), er, jr["t"], dict(ctx_j, close=price))
+            if pos and side_sig == pos["dir"]:
+                jr["action"] = "skip: already in a trade"
             log(f"{sym}: price {price:.4f} | forecast {er:+.2%} | "
                 f"{'EXIT ' if exit_now else ''}{('LONG' if enter_dir == 1 else 'SHORT') if enter_dir else ('HOLD' if not exit_now else '')}"
                 + (f" | {filters.describe(ctx)}" if ctx else ""))
             why = (cooldown_block(state, sym, enter_dir) or filters.entry_block(enter_dir, ctx)) if enter_dir else None
+            if enter_dir and not why:
+                why, jr["p"] = L.gate(jr["feats"])
+                if jr["p"] is not None:
+                    log(f"{sym}: learned win chance {jr['p']:.0%}")
             if why:                 # exit above still happens; only the new entry is vetoed
                 log(f"{sym}: {'LONG' if enter_dir == 1 else 'SHORT'} entry blocked: {why}")
+                jr["action"] = f"blocked: {why}"
                 enter_dir = 0
             if pos and exit_now:
                 fill, pnl = broker.close(state, sym, price, "signal")
@@ -320,28 +366,41 @@ def run_cycle(state, predictor, broker, fetch=fetch_futures_candles):
             if enter_dir and sym not in untracked:
                 if halted or len(state["positions"]) >= MAX_POSITIONS:
                     log(f"{sym}: entry skipped (limit reached)")
+                    jr["action"] = "skip: daily loss limit" if halted else "skip: no free slot"
                     continue
                 same = sum(1 for p in state["positions"].values() if p["dir"] == enter_dir)
                 if MAX_SAME_SIDE and same >= MAX_SAME_SIDE:
                     log(f"{sym}: entry skipped (already {same} {'longs' if enter_dir == 1 else 'shorts'}, MAX_SAME_SIDE)")
+                    jr["action"] = "skip: max same side"
                     continue
                 plan = choose_leverage_and_notional(equity, exposure(state, prices), er,
                                                     ENTRY_THRESHOLD, STOP_PCT, RISK_FRAC)
                 if not plan or plan["notional"] < MIN_NOTIONAL:
                     log(f"{sym}: entry skipped (no room under exposure cap)")
+                    jr["action"] = "skip: exposure cap"
                     continue
                 if plan["notional"] / plan["leverage"] > available * 0.95:
                     log(f"{sym}: entry skipped (not enough free margin)")
+                    jr["action"] = "skip: margin"
                     continue
                 pos = broker.open(state, sym, enter_dir, price, plan["notional"], plan["leverage"],
                                   str(c["timestamps"].iloc[-1]))
+                jr["action"] = "opened"
                 log(f"{sym}: OPENED {'LONG' if enter_dir == 1 else 'SHORT'} {plan['notional']:.2f} USDT "
                     f"@ {pos['entry']:.4f} | leverage {plan['leverage']}x (strength {plan['strength']:.2f}) "
                     f"| stop {pos['stop']:.4f} take {pos['take']:.4f}")
+            elif enter_dir and sym in untracked:
+                jr["action"] = "skip: untracked position on coin"
         except Exception as e:
             log(f"{sym}: cycle error: {e}")
+            jr["action"] = "error"
         save_state(state)
     save_state(state)
+    try:
+        L.record(journal)
+        L.maybe_retrain()
+    except Exception as e:
+        log(f"learner failed: {e}")
 
 
 def main():
@@ -359,6 +418,7 @@ def main():
         f"margin/position <= {MAX_MARGIN_FRAC:.0%} | stop {STOP_PCT:.0%} | daily loss limit {DAILY_LOSS_LIMIT:.0%}")
     predictor = load_predictor()
     state = load_state()
+    learner()
     step = STEP_SECONDS[INTERVAL]
     while True:
         if os.path.exists("STOP"):
